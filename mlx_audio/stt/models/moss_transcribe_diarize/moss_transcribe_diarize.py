@@ -88,6 +88,32 @@ class MossWhisperEncoder(nn.Module):
         return self.layer_norm(hidden_states)
 
 
+class MossRoPE(nn.Module):
+    """Native RoPE with the published MOSS BF16 runner's inverse frequencies."""
+
+    def __init__(self, dims: int, base: float):
+        super().__init__()
+        self.dims = dims
+        with mx.stream(mx.cpu):
+            inverse = 1 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
+            inverse = inverse.astype(mx.bfloat16).astype(mx.float32)
+            # MLX expects denominators. Keep this derived FP32 buffer out of
+            # parameters so checkpoint loading and weight casts leave it intact.
+            self._freqs = mx.reciprocal(inverse)
+            mx.eval(self._freqs)
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._freqs,
+        )
+
+
 class MossBackbone(nn.Module):
     """Whisper encoder + Qwen3 decoder backbone with MOSS audio injection."""
 
@@ -95,6 +121,10 @@ class MossBackbone(nn.Module):
         super().__init__()
         self.config = config
         self.language_model = TextModel(config.text_config)
+        if config.text_config.rope_scaling is None:
+            rope = MossRoPE(config.text_config.head_dim, config.text_config.rope_theta)
+            for layer in self.language_model.layers:
+                layer.self_attn.rope = rope
         self.whisper_encoder = MossWhisperEncoder(config.audio_config)
         self.vq_adaptor = VQAdaptor(
             input_dim=config.adaptor_input_dim,
